@@ -3,7 +3,7 @@
 End-to-end deep reinforcement learning controllers for autonomous underwater vehicles, trained in the
 [Stonefish](https://github.com/patrykcieslak/stonefish) simulator with ROS 2 Jazzy. The policy maps the vehicle state and
 tracking errors directly to thruster commands (and, for articulated thrusters, servo angle rates), replacing the
-thrust-allocation QP + PID of the model-based controller ([mvp_control](https://github.com/GSO-soslab/mvp_control), [Out IROS 2025 paper](https://ieeexplore.ieee.org/abstract/document/11246645)),
+thrust-allocation QP + PID of the model-based controller ([mvp_control](https://github.com/GSO-soslab/mvp_control), [Our IROS 2025 paper](https://ieeexplore.ieee.org/abstract/document/11246645)),
 which is kept as the baseline.
 
 - **Vehicles** (`sb3/vehicles.py`, selected with `RACE2_VEHICLE`):
