@@ -1,0 +1,16 @@
+# DreamerV3 on the RACE2 tracking env (sb3/dreamer_train.py). The env and reward come from config_sac.yaml, as for PPO/TD3.
+# Starts from dreamerv3-torch `defaults` + `dmc_proprio` (the paper's proprioceptive setup, ~12M parameters);
+# only the keys below differ.
+dreamer:
+  seed: 1                     # --seed overrides
+  action_repeat: 1            # the env already runs at its 10 Hz control period
+  envs: 23                    # informational; --n_envs sets the number of sims
+  prefill: 10000              # random-action env steps before learning (as TD3 learning_starts)
+  pretrain: 100               # world-model/actor updates on the prefill data (upstream default)
+  train_ratio: 512            # upper bound on replayed steps per env step; the learner trains as fast as it can up to it
+  dataset_size: 1000000       # replay capacity in env steps (FIFO by episode)
+  log_every: 10000            # env steps between progress.csv rows
+  compile: true               # learner only (+20 % updates/s in the offline test); the acting copy runs uncompiled
+  video_pred_log: false
+  eval_episode_num: 0         # evaluation runs separately (eval_fig4.py --algo dreamer)
+  device: 'cuda:0'

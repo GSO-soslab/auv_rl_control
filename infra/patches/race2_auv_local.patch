@@ -1,0 +1,266 @@
+# Local patch on race2_auv jazzy-devel (43e69a6): servo_limit_deg launch arg, mvp_control config for mvp_control jazzy-devel (v gains, delta_limit).
+# Apply: git -C ~/ros2_ws/src/race2_auv apply <this file>
+diff --git a/race2_auv_bringup/launch/bringup_simulation.launch.py b/race2_auv_bringup/launch/bringup_simulation.launch.py
+index a0f2b2b..8a84329 100644
+--- a/race2_auv_bringup/launch/bringup_simulation.launch.py
++++ b/race2_auv_bringup/launch/bringup_simulation.launch.py
+@@ -18,7 +18,9 @@ def generate_launch_description():
+     # simulation
+     simulation = IncludeLaunchDescription(
+         PythonLaunchDescriptionSource([os.path.join(get_package_share_directory(robot_bringup), 'launch','include','simulation.launch.py')]),
+-        launch_arguments = {'arg_robot_name': arg_robot_name}.items()    
++        launch_arguments = {'arg_robot_name': arg_robot_name,
++                            'render': LaunchConfiguration('render'),
++                            'servo_limit_deg': LaunchConfiguration('servo_limit_deg')}.items()
+     )
+ 
+     # robot localization
+@@ -36,10 +38,18 @@ def generate_launch_description():
+     #mvp_control
+     mvp_control = IncludeLaunchDescription(
+         PythonLaunchDescriptionSource([os.path.join(get_package_share_directory(robot_bringup), 'launch','include','mvp_control.launch.py')]),
+-        launch_arguments = {'arg_robot_name': arg_robot_name}.items()  
++        launch_arguments = {'arg_robot_name': arg_robot_name,
++                            'rl_mode': LaunchConfiguration('rl_mode'),
++                            'servo_limit_deg': LaunchConfiguration('servo_limit_deg')}.items()
+     )
+ 
+     return LaunchDescription([
++        DeclareLaunchArgument('render', default_value='true',
++                              description='false: Stonefish without rendering (no camera), much cheaper'),
++        DeclareLaunchArgument('rl_mode', default_value='false',
++                              description='true: mvp_control does not drive the actuators (RL agent does)'),
++        DeclareLaunchArgument('servo_limit_deg', default_value='',
++                              description='azimuth servo limit +-deg for the sim joint and mvp angle_limits (empty: scene/config defaults)'),
+         simulation,
+         description,
+         localization,
+diff --git a/race2_auv_bringup/launch/include/mvp_control.launch.py b/race2_auv_bringup/launch/include/mvp_control.launch.py
+index 066bb9d..995f333 100644
+--- a/race2_auv_bringup/launch/include/mvp_control.launch.py
++++ b/race2_auv_bringup/launch/include/mvp_control.launch.py
+@@ -1,13 +1,24 @@
+ import os
++import re
++import tempfile
+ 
+ from ament_index_python.packages import get_package_share_directory
+ from launch import LaunchDescription
+ from launch_ros.actions import Node
+ from launch.substitutions import LaunchConfiguration
+-from launch.actions import TimerAction
++from launch.actions import TimerAction, DeclareLaunchArgument, OpaqueFunction
+ 
++# Actuator topics mvp_control publishes (relative to the robot namespace).
++# With rl_mode:=true they are remapped to an unused namespace, so the zeros mvp_control
++# publishes while disabled don't override the RL agent's commands.
++ACTUATOR_TOPICS = [
++    'control/thruster/heave_stern', 'control/thruster/heave_bow',
++    'control/thruster/surge_port', 'control/thruster/surge_starboard',
++    'control/surge_port_servo', 'control/surge_starboard_servo',
++]
+ 
+-def generate_launch_description():
++
++def launch_setup(context):
+     robot_name = 'race2_auv'
+     robot_bringup = robot_name + '_bringup'
+     robot_config = robot_name + '_config'
+@@ -21,8 +32,21 @@ def generate_launch_description():
+     )
+     mvp_control_config_file = os.path.join(robot_config_path, 'mvp_control_config', 'config.yaml') 
+     mvp_control_param_file = os.path.join(robot_param_path, 'mvp_control.yaml') 
++    # servo_limit_deg:=N -> temporary copy of the mvp config with angle_limits [-N, N] deg (QP constraint, IROS 2025 Eq. 5)
++    lim = LaunchConfiguration('servo_limit_deg', default='').perform(context)
++    if lim:
++        rad = float(lim) * 3.141592653589793 / 180.0
++        cfg = open(mvp_control_config_file).read()
++        cfg, n = re.subn(r'angle_limits: *\[[^\]]*\]', f'angle_limits: [{-rad:.4f}, {rad:.4f}]', cfg)
++        assert n == 2, f'expected 2 angle_limits in {mvp_control_config_file}, found {n}'
++        fd, mvp_control_config_file = tempfile.mkstemp(prefix=f'race2_mvp_servo{lim}_', suffix='.yaml')
++        os.write(fd, cfg.encode()); os.close(fd)
+ 
+-    return LaunchDescription([
++    remappings = [('servo_joint_topic', 'stonefish/servo/joint_states')]
++    if LaunchConfiguration('rl_mode').perform(context).lower() in ('true', '1'):
++        remappings += [(t, t.replace('control/', 'control/mvp_unused/', 1)) for t in ACTUATOR_TOPICS]
++
++    return [
+ 
+         TimerAction(period=5.0,
+             actions=[
+@@ -39,10 +63,16 @@ def generate_launch_description():
+                             {'odometry_source': '/'+ robot_name + '/odometry/filtered'},
+                             mvp_control_param_file
+                             ],
+-                        remappings=[
+-                            ('servo_joint_topic', 'stonefish/servo/joint_states'),
+-                            ],
++                        remappings=remappings,
+                         )
+             ])
+         
+-])
+\ No newline at end of file
++]
++
++
++def generate_launch_description():
++    return LaunchDescription([
++        DeclareLaunchArgument('rl_mode', default_value='false',
++                              description='Detach mvp_control from the actuators (RL training)'),
++        OpaqueFunction(function=launch_setup),
++    ])
+diff --git a/race2_auv_bringup/launch/include/simulation.launch.py b/race2_auv_bringup/launch/include/simulation.launch.py
+index 2eb699f..dd3b120 100644
+--- a/race2_auv_bringup/launch/include/simulation.launch.py
++++ b/race2_auv_bringup/launch/include/simulation.launch.py
+@@ -1,12 +1,15 @@
+ import os
++import re
++import tempfile
+ 
+ from ament_index_python.packages import get_package_share_directory
+ from launch import LaunchDescription
+ from launch_ros.actions import Node
+ from launch.substitutions import LaunchConfiguration
++from launch.actions import DeclareLaunchArgument, OpaqueFunction
+ 
+ 
+-def generate_launch_description():
++def launch_setup(context):
+     robot_name = 'race2_auv'
+     robot_bringup = robot_name + '_bringup'
+     
+@@ -16,6 +19,21 @@ def generate_launch_description():
+ 
+     simulation_data = os.path.join(world_of_stonefish_dir, 'data/')
+     scenario_desc = os.path.join(world_of_stonefish_dir, 'world', sim_world)
++    # servo_limit_deg:=N -> temporary copy of the scenario with the servo joint limits set to +-N deg
++    lim = LaunchConfiguration('servo_limit_deg', default='').perform(context)
++    if lim:
++        rad = f"{float(lim) * 3.141592653589793 / 180.0:.4f}"
++        lines, n = open(scenario_desc).read().split('\n'), 0
++        for i, line in enumerate(lines):
++            if '<!--' in line:   # skip the commented-out alternatives
++                continue
++            lines[i], k = re.subn(r'(<arg name ="servo_m(in|ax)_ang" value = ")[^"]*(")',
++                                  lambda m: m.group(1) + ('-' if m.group(2) == 'in' else '') + rad + m.group(3), line)
++            n += k
++        scn = '\n'.join(lines)
++        assert n == 2, f'expected 2 active servo limit args in {scenario_desc}, found {n}'
++        fd, scenario_desc = tempfile.mkstemp(prefix=f'race2_servo{lim}_', suffix='.scn')
++        os.write(fd, scn.encode()); os.close(fd)
+     simulation_rate = "100"
+     window_res_x = "800"
+     window_res_y = "800"
+@@ -28,14 +46,23 @@ def generate_launch_description():
+ 
+     stonefish_driver_param_file = os.path.join(robot_param_path, 'sim_params.yaml') 
+ 
+-    return LaunchDescription([
++    render = LaunchConfiguration('render').perform(context).lower() in ('true', '1')
++
++    return [
+         # simulation node
++        # render:=false -> no OpenGL at all (same physics + IMU/DVL/pressure/GPS, no camera images);
++        # ~20x cheaper, used for packing many training sims.
+         Node(
+             package="stonefish_ros2",
+             executable="stonefish_simulator",
+             name="stonefish_simulator",
+             # output="screen",
+             arguments=[simulation_data, scenario_desc, simulation_rate, window_res_x, window_res_y, rendering_quality]
++        ) if render else Node(
++            package="stonefish_ros2",
++            executable="stonefish_simulator_nogpu",
++            name="stonefish_simulator",
++            arguments=[simulation_data, scenario_desc, simulation_rate]
+         ),
+ 
+         Node(
+@@ -90,4 +117,12 @@ def generate_launch_description():
+                 {'frame_id': robot_name + '/world'}]
+         ),
+ 
+-    ])
+\ No newline at end of file
++        ]
++
++
++def generate_launch_description():
++    return LaunchDescription([
++        DeclareLaunchArgument('render', default_value='true',
++                              description='false: run stonefish_simulator_nogpu (no rendering)'),
++        OpaqueFunction(function=launch_setup),
++    ])
+diff --git a/race2_auv_config/mvp_control_config/config.yaml b/race2_auv_config/mvp_control_config/config.yaml
+index 6c3f458..31b752c 100644
+--- a/race2_auv_config/mvp_control_config/config.yaml
++++ b/race2_auv_config/mvp_control_config/config.yaml
+@@ -2,23 +2,23 @@ control_modes:
+   idle: false
+ 
+   teleop:
+-    z:        {p: 20.0,    i: 2.0 ,  d: 5.0,  pid_max: 30, pid_min: -30}
+-    u:        {p: 50.0,    i: 10.0,   d: 0.0,   pid_max: 30, pid_min: -30}
+-    pitch:    {p: 30.0,   i: 0.5,  d: 1.0,  pid_max: 20, pid_min: -20}
+-    yaw:      {p: 10.0,   i: 0.2,   d: 5.0,  pid_max: 20, pid_min: -20}
++    z:        {p: 20.0,    i: 2.0 ,  d: 5.0,  v: 0.0,  pid_max: 30, pid_min: -30}
++    u:        {p: 50.0,    i: 10.0,   d: 0.0,   v: 0.0,  pid_max: 30, pid_min: -30}
++    pitch:    {p: 30.0,   i: 0.5,  d: 1.0,  v: 0.0,  pid_max: 20, pid_min: -20}
++    yaw:      {p: 10.0,   i: 0.2,   d: 5.0,  v: 0.0,  pid_max: 20, pid_min: -20}
+ 
+   flight:
+     # z:        {p: 20.0,    i: 2.0 ,  d: 5.0,  i_max: 30, i_min: -30}
+-    u:    {p: 50.0,    i: 10.0,   d: 0.0,   pid_max: 30, pid_min: -30}
++    u:    {p: 50.0,    i: 10.0,   d: 0.0,   v: 0.0,  pid_max: 30, pid_min: -30}
+     # pitch:    {p: 10.0,    i: 0.0,   d: 10.0,  i_max: 20, i_min: -20}
+     # yaw:      {p: 10.0,    i: 1.0,   d: 10.0,  i_max: 30, i_min: -30}
+ 
+   4dof:
+-    z:        {p: 10.0,   i: 5.0 ,  d: 5.0,  pid_max: 30, pid_min: -30}
+-    u:        {p: 20.0,    i: 20.0,   d: 0.0,   pid_max: 50, pid_min: -50}
+-    v:        {p: 5.0,    i: 1.0,   d: 0.2,   pid_max: 20, pid_min: -20}
+-    pitch:    {p: 5.0,   i: 1.0,  d: 1.0,  pid_max: 20, pid_min: -20}
+-    yaw:      {p: 15.0,   i: 2.0,   d: 5.0,  pid_max: 20, pid_min: -20}
++    z:        {p: 10.0,   i: 5.0 ,  d: 5.0,  v: 0.0,  pid_max: 30, pid_min: -30}
++    u:        {p: 20.0,    i: 20.0,   d: 0.0,   v: 0.0,  pid_max: 50, pid_min: -50}
++    v:        {p: 5.0,    i: 1.0,   d: 0.2,   v: 0.0,  pid_max: 20, pid_min: -20}
++    pitch:    {p: 5.0,   i: 1.0,  d: 1.0,  v: 0.0,  pid_max: 20, pid_min: -20}
++    yaw:      {p: 15.0,   i: 2.0,   d: 5.0,  v: 0.0,  pid_max: 20, pid_min: -20}
+ 
+ thruster_ids:
+ 
+@@ -28,6 +28,7 @@ thruster_ids:
+     force_topic: control/force/heave_stern
+     limits: [-25.0, 25.0] #[min, max]
+     polynomials: [0.0305, 18.9527, 6.1205, 64.0375, 2.4386, -24.8871]
++    delta_limit: 200.0   # N per control step; 200 = effectively unlimited (old behavior)
+ 
+   heave_bow:
+     control_tf: heave_bow_thruster_link
+@@ -35,6 +36,7 @@ thruster_ids:
+     force_topic: control/force/heave_bow
+     limits: [-20.0, 20.0] #[min, max]
+     polynomials: [0.0305, 18.9527, 6.1205, 64.0375, 2.4386, -24.8871]
++    delta_limit: 200.0   # N per control step; 200 = effectively unlimited (old behavior)
+ 
+ vector_thruster_ids:
+   surge_port:
+@@ -43,6 +45,7 @@ vector_thruster_ids:
+     force_topic: control/force/surge_port
+     limits: [-25.0, 25.0] #[min, max]
+     polynomials: [0.0305, 18.9527, 6.1205, 64.0375, 2.4386, -24.8871]
++    delta_limit: 200.0   # N per control step; 200 = effectively unlimited (old behavior)
+     servo_topic: control/surge_port_servo
+     servo_joint: surge_port_servo_joint
+     servo_speed: 2.0
+@@ -54,6 +57,7 @@ vector_thruster_ids:
+     force_topic: control/force/surge_starboard
+     limits: [-25.0, 25.0] #[min, max]
+     polynomials: [0.0305, 18.9527, 6.1205, 64.0375, 2.4386, -24.8871]
++    delta_limit: 200.0   # N per control step; 200 = effectively unlimited (old behavior)
+     servo_topic: control/surge_starboard_servo
+     servo_joint: surge_starboard_servo_joint
+     servo_speed: 2.0

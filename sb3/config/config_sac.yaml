@@ -12,7 +12,7 @@ setpoint:
   ori_y_range: [-0.1, 0.1]
   
   # Velocity X range (surge) - Forward/backward speed targets
-  vel_x_range: [-0.25, 0.25]
+  vel_x_range: [-1.0, 1.0]     # surge targets (stage >= 2), m/s; RACE2 tops out at ~1.0 m/s
 
 others:
   random_seed: 42
@@ -22,7 +22,9 @@ environment:
   servo_joints_size: 0
   max_action: 1.0
   min_servo_angle_rad: -1.57 # -45 degrees in radians
-  max_servo_angle_rad: 1.57 # 45 degrees in radians
+  max_servo_angle_rad: 1.57 # 90 degrees (RACE2_SERVO_LIMIT_DEG overrides: 45 / 90 / 135)
+  servo_max_velocity: 1.0   # rad/s, matches race2_auv.scn servo max_velocity
+  action_mode: naive        # naive = absolute servo angles; rate = angle step a*w*dt from the measured angle (RACE2_ACTION overrides)
 
 training:
   max_episodes: 1500
@@ -74,6 +76,75 @@ coupling:
   energy:
     spring_stiffness: 0.3     # REDUCED from 0.5 (gentler coupling)
     damping_factor: 0.4       # INCREASED from 0.2 (more damping for stability)
+
+# Online tracking reward (AUVEnv tracking mode). Remove this section to fall back to the
+# legacy `reward_function` below (still used for CSV/offline training).
+# Per DOF: [weight, sigma]. Each DOF scores 0.5*exp(-(e/sigma)^2) + 0.5*(1 - tanh(e/(coarse_factor*sigma)))
+# in [0, 1]: sigma sets the precision you get full credit for, the tanh term keeps a gradient far away.
+tracking_reward:
+  dofs:
+    depth: [1.0, 0.10]   # m
+    surge: [3.0, 0.05]   # m/s; weight 3 so surge dominates once depth/yaw are learned (stage 2)
+    pitch: [0.5, 0.087]  # rad (5 deg)
+    yaw:   [1.0, 0.087]  # rad (5 deg)
+    roll:  [0.5, 0.087]  # rad, keeps the vehicle upright
+  coarse_factor: 10
+  k_rate: 0.05           # mean squared change of normalized action per step
+  k_effort: 0.01         # mean squared thruster command
+  k_oob: 1.0             # per step outside depth_bounds
+  depth_bounds: [0.3, 10.0]
+  k_yaw_rate: 0.05       # (rad/s)^2, discourages spinning
+  # State + episode handling
+  state_source: ground_truth    # Stonefish odometry_gt (needs odom_gt sensor in race2_auv.scn); remove -> mvp/EKF state
+  control_dt: 0.1               # s per env step (10 Hz)
+  episode_seconds: 60
+  spawn_depth: [1.0, 6.0]       # respawn depth range at each reset (random heading)
+  settle_seconds: 1.0
+  terminate_depth: [0.0, 15.0]  # end episode (and respawn) outside this
+  terminate_roll_pitch: 1.0     # rad
+  k_terminate: 10.0
+  # Surge tracking mode: instant | horizon (env RACE2_SURGE_REWARD). horizon = command -> reference model ->
+  # track u_ref and the along-track displacement to a virtual target moving at u_ref (velocity over a horizon)
+  surge_mode: instant          # instant | horizon | integral_obs (ablation: observe integral, reward instant)
+  surge_horizon: {wn: 0.5, zeta: 1.0, a_max: 0.15, leak_tau: 20.0, s_max: 2.0, sigma_s: 0.3}
+  # Azimuth-thruster terms from Zhou, Naderi, Yuan (IROS 2025); active only when paper_terms: true
+  # or env RACE2_PAPER_TERMS=1 (kept off by default so earlier runs' reward is unchanged)
+  paper_terms: false
+  effort_adaptive: {k: 0.04, a: 3.0}    # Eq. 4 as in mvp_control: k/(1+exp(-a*d)), k/2 at zero error -> k at large demand
+  k_slew: 0.02                          # servo slew, (measured dbeta / (w*dt))^2
+  # Task extensions, each off unless its env var is set (older models evaluate unchanged)
+  depth_invariant:              # RACE2_DEPTH_INV=1: policy does not see absolute depth, so it works at any depth
+    error_clip: 3.0             # m, observed depth error saturates (a 40 m dive looks like "far below")
+    surface_feature: 1.0        # m, observe min(depth, this): only the near-surface region is distinguishable
+    pos_z_range: [1.0, 20.0]    # depth targets (race2_test.scn seabed is at >= 30 m)
+    spawn_depth: [1.0, 15.0]
+    depth_bounds: [0.3, 25.0]
+    terminate_depth: [0.0, 28.0]
+  attitude_setpoints:           # RACE2_ATT_SP=1: commanded pitch (and roll, articulated only) instead of 0
+    pitch_range_deg: [-45, 45]
+    roll_range_deg: [-45, 45]   # only with servos: the heave thrusters are on the centerline, so fixed thrusters have no roll authority
+    level_prob: 0.4             # fraction of segments with roll = pitch = 0
+    weight: 1.0                 # reward weight of commanded pitch/roll (0.5 when only regulated to 0)
+    terminate_roll_pitch: 1.4   # rad (80 deg); ZYX Euler is singular only at 90 deg pitch
+  terminate_att_error: 1.4      # rad; RACE2_ATT_REP=rot: end the episode when the tilt error (actual vs reference body z axis) exceeds this
+  reference_model:              # RACE2_REF_ALL=1: depth/yaw/pitch/roll targets pass through a reference model
+                                # (as surge in horizon mode); reward + observation use the error to the reference
+    depth: {wn: 0.5, v_max: 0.3,  a_max: 0.1}   # m; RACE2 climbs ~0.4 m/s at full heave thrust
+    yaw:   {wn: 0.8, v_max: 0.35, a_max: 0.3}   # rad (v_max ~20 deg/s; measured 90 deg turn in ~3 s)
+    pitch: {wn: 1.0, v_max: 0.35, a_max: 0.5}
+    roll:  {wn: 1.0, v_max: 0.35, a_max: 0.5}
+  error_integral:               # RACE2_INTEGRAL=1: leaky, clamped integral of the (reference) error for depth/yaw/pitch/roll,
+                                # observed and rewarded like surge's s_err, I += e dt, I *= (1 - dt/tau), |I| <= max
+    tau: 20.0                   # s (same leak as surge_horizon)
+    depth: {sigma: 1.0, max: 4.0}   # m*s; a 0.1 m offset held for long gives I = 2 m*s
+    yaw:   {sigma: 0.5, max: 2.0}   # rad*s; a 1 deg offset gives I = 0.35 rad*s
+    pitch: {sigma: 0.5, max: 2.0}
+    roll:  {sigma: 0.5, max: 2.0}
+  # Env overrides for setpoint ranges (feasible ranges measured open loop at 6 m, see docs §5a):
+  # RACE2_ROLL_MAX_DEG, RACE2_PITCH_MAX_DEG (attitude_setpoints ranges), RACE2_DEPTH_MAX (depth_invariant pos_z_range max)
+  setpoint_change_seconds: 20   # new random depth/surge/yaw step command every N s within an episode (0 = off)
+  hover_prob: 0.2               # fraction of segments with surge target 0 (hold/hover)
+  stage: 3                      # 3 = all commanded (default now); 1 depth only, 2 + surge. Kept for reference: 1 depth (hold heading, zero surge), 2 +surge, 3 +yaw; env RACE2_STAGE overrides
 
 reward_function:
   w1: 0.8                     # REDUCED from 1.0 (less harsh energy penalty)

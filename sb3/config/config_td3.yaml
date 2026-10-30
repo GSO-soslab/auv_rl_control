@@ -1,0 +1,22 @@
+# TD3 hyperparameters (Fujimoto et al. 2018 defaults). The env and reward come from config_sac.yaml, as for PPO/DDPG.
+others:
+  random_seed: 42             # --seed overrides
+
+agent:
+  learning_rate: 0.001
+  buffer_size: 1000000
+  learning_starts: 10000      # env steps of random actions before learning
+  batch_size: 256
+  gamma: 0.99
+  tau: 0.005
+  noise_sigma: 0.1            # Gaussian exploration noise on actions in [-1, 1]
+  policy_delay: 2             # actor/target update every 2 critic updates
+  target_policy_noise: 0.2    # target policy smoothing
+  target_noise_clip: 0.5
+
+qnetwork:
+  actor_hidden_layers: [256, 256]
+  critic_hidden_layers: [256, 256]
+
+plotting:
+  plot_interval: 10

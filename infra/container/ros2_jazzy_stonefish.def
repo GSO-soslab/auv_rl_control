@@ -1,0 +1,36 @@
+Bootstrap: docker
+From: osrf/ros:jazzy-desktop
+
+%post
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        build-essential cmake git wget curl python3-pip python3-colcon-common-extensions \
+        libglm-dev libsdl2-dev libfreetype6-dev \
+        libgsl-dev libgeographiclib-dev geographiclib-tools libeigen3-dev libboost-all-dev libpcl-dev \
+        ros-jazzy-robot-localization ros-jazzy-pcl-conversions ros-jazzy-pcl-ros \
+        ros-jazzy-geographic-msgs ros-jazzy-tf-transformations ros-jazzy-image-transport \
+        ros-jazzy-cv-bridge ros-jazzy-tf2-eigen ros-jazzy-tf2-geometry-msgs \
+        ros-jazzy-robot-state-publisher ros-jazzy-joint-state-publisher ros-jazzy-xacro \
+        ros-jazzy-rosbag2-storage-mcap ros-jazzy-foxglove-bridge \
+        xvfb xauth mesa-utils libgl1 libegl1 libglvnd0 libglx0 x11-apps
+    # VirtualGL: GLX window -> NVIDIA EGL device, so Stonefish renders on the GPU without a GPU X server
+    wget -q -O /tmp/vgl.deb https://github.com/VirtualGL/virtualgl/releases/download/3.1.5/virtualgl_3.1.5_amd64.deb
+    apt-get install -y /tmp/vgl.deb && rm /tmp/vgl.deb
+    # Stonefish (GSO-soslab fork, jazzy-devel)
+    git clone -b jazzy-devel --depth 1 https://github.com/GSO-soslab/stonefish /opt/stonefish
+    cd /opt/stonefish && mkdir -p build && cd build && cmake .. -DCMAKE_BUILD_TYPE=Release && make -j"$(nproc)" && make install
+    ldconfig
+    # Python RL stack (system python so rclpy works alongside it)
+    pip3 install --break-system-packages --no-cache-dir \
+        torch stable-baselines3 gymnasium "gym==0.26.2" tqdm h5py scikit-learn wandb \
+        pandas matplotlib pyyaml tensorboard mcap mcap-ros2-support "numpy<2" "setuptools<80"
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+%environment
+    export LC_ALL=C.UTF-8
+    export LANG=C.UTF-8
+    export PATH=/opt/VirtualGL/bin:$PATH
+
+%runscript
+    exec bash --rcfile /opt/ros/jazzy/setup.bash "$@"

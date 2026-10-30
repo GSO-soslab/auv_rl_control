@@ -1,5 +1,5 @@
 others:
-  random_seed: 42
+  random_seed: null  # null = new random seed each run (printed at start); set a number to reproduce
 
 environment:
   thruster_size: 4
@@ -11,7 +11,7 @@ environment:
 training:
   max_episodes: 1000
   max_t: 200
-  save_freq_timesteps: 10000  # Save every 10k timesteps for PPO
+  save_freq_timesteps: 100000  # every 100k steps = the checkpoint-eval spacing (10k gave 300 files/run)
 
 agent:
   learning_rate: 0.0003  # Slightly higher for PPO

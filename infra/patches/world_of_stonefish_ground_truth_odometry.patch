@@ -1,0 +1,42 @@
+# Local patch on world_of_stonefish jazzy-devel-race-docking-station (d51d59e): ground-truth odometry sensors for RL
+# (race2_auv.scn, race_auv.scn). Apply: git -C ~/ros2_ws/src/world_of_stonefish apply <this file>
+diff --git a/vehicles/race2_auv.scn b/vehicles/race2_auv.scn
+index ff7d42c..e2587f5 100644
+--- a/vehicles/race2_auv.scn
++++ b/vehicles/race2_auv.scn
+@@ -372,6 +372,15 @@
+             <ros_publisher topic="/$(arg robot_name)/dvl/stonefish/raw" altitude_topic="/$(arg robot_name)/dvl/stonefish/altitude"/>
+         </sensor>
+ 
++        <!-- Ground-truth odometry for RL training (env state independent of the EKF) -->
++        <sensor name="odom_gt" type="odometry" rate="20.0">
++            <link name="Base"/>
++            <origin rpy="0.0 0.0 0.0" xyz="0.0 0.0 0.0"/>
++            <noise position="0.0" velocity="0.0" angle="0.0" angular_velocity="0.0"/>
++            <history samples="1"/>
++            <ros_publisher topic="/$(arg robot_name)/odometry/ground_truth"/>
++        </sensor>
++
+         <world_transform xyz="0.0 0.0 0.5" rpy="0.0 0.0 0.0"/>
+ 
+ 
+diff --git a/vehicles/race_auv.scn b/vehicles/race_auv.scn
+index 338b699..dda2b2d 100644
+--- a/vehicles/race_auv.scn
++++ b/vehicles/race_auv.scn
+@@ -195,6 +195,15 @@
+             <ros_publisher topic="$(arg robot_name)/stonefish/odometry"/>
+         </sensor>
+ 
++        <!-- Ground-truth odometry for RL training (env state independent of the EKF), as in race2_auv.scn -->
++        <sensor name="odom_gt" type="odometry" rate="20.0">
++            <link name="Base"/>
++            <origin rpy="0.0 0.0 0.0" xyz="0.0 0.0 0.0"/>
++            <noise position="0.0" velocity="0.0" angle="0.0" angular_velocity="0.0"/>
++            <history samples="1"/>
++            <ros_publisher topic="/$(arg robot_name)/odometry/ground_truth"/>
++        </sensor>
++
+         <!-- <sensor name="gps" type="gps" rate="1.0">
+             <link name="Base"/>
+             <origin rpy="0.0 0.0 0.0" xyz="-0.5 0.0 -0.18"/>
