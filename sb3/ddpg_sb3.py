@@ -21,6 +21,8 @@ from gym.wrappers import TimeLimit
 
 # Import custom environment
 from AUVEnv import AUVEnv
+from vec_env_utils import checkpoint_dir, make_env
+from tracking_logger import TrackingLogger
 
 class RewardPlottingCallback(BaseCallback):
     """
@@ -180,6 +182,13 @@ def main():
     parser.add_argument('--mode', type=str, default='train', choices=['train', 'test'], help='Training or testing mode')
     parser.add_argument('--model', type=str, default=None, help='Path to model file for testing')
     parser.add_argument('--timesteps', type=int, default=None, help='Total timesteps for training')
+    parser.add_argument('--seed', type=int, default=None, help='Random seed (default: config others.random_seed; random if that is null)')
+    parser.add_argument('--n_envs', type=int, default=1, help='Parallel sims feeding one learner (each on its own ROS domain)')
+    parser.add_argument('--domain_base', type=int, default=None, help='ROS_DOMAIN_ID of sim 0 (default: $ROS_DOMAIN_ID)')
+    parser.add_argument('--buffer_size', type=int, default=None, help='Replay buffer size (overrides config)')
+    parser.add_argument('--batch_size', type=int, default=None, help='Minibatch size (overrides config)')
+    parser.add_argument('--utd', type=int, default=1, help='Update-to-data ratio: gradient steps per collected transition')
+    parser.add_argument('--net', type=str, default=None, help='Hidden layers for actor and critic, e.g. 1024,1024,1024 (overrides config)')
     args = parser.parse_args()
     
     # Load configuration
@@ -187,12 +196,15 @@ def main():
     config = load_config(config_path)
     
     # Set random seed
-    random_seed = config['others']['random_seed']
+    random_seed = args.seed if args.seed is not None else config['others'].get('random_seed')
+    if random_seed is None:
+        random_seed = int.from_bytes(os.urandom(4), 'little') % 100000
+    print(f"Random seed: {random_seed}")
     np.random.seed(random_seed)
     th.manual_seed(random_seed)
     
     # Create environment
-    env = AUVEnv()
+    env = make_env(args.n_envs if args.mode == 'train' else 1, args.domain_base)
     
     # Limit episode length
     max_episode_steps = config['training']['max_t']
@@ -200,7 +212,11 @@ def main():
     
     # Set up logging directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_dir = os.path.join("logs", f"ddpg_{timestamp}")
+    run_tag = "".join(f"_{k.split('_', 1)[1].lower()}-{os.environ[k]}" for k in
+                      ("RACE2_VEHICLE", "RACE2_STAGE", "RACE2_SURGE_REWARD", "RACE2_ACTION", "RACE2_SERVOS", "RACE2_SERVO_LIMIT_DEG",
+                           "RACE2_PAPER_TERMS", "RACE2_DEPTH_INV", "RACE2_ATT_SP", "RACE2_K_SLEW", "RACE2_REF_ALL", "RACE2_ATT_REP", "RACE2_INTEGRAL", "RACE2_ROLL_MAX_DEG",
+                           "RACE2_PITCH_MAX_DEG", "RACE2_DEPTH_MAX") if k in os.environ) + f"_seed-{random_seed}"
+    log_dir = os.path.join("logs", f"ddpg_{timestamp}{run_tag}")
     os.makedirs(log_dir, exist_ok=True)
     
     # Use our custom monitor instead of SB3's Monitor which requires gymnasium
@@ -211,7 +227,7 @@ def main():
         n_actions = env.action_space.shape[-1]
         
         # Configure action noise (using Ornstein-Uhlenbeck by default)
-        noise_sigma = config['agent']['epsilon_initial']  # Using epsilon as initial noise scale
+        noise_sigma = config['agent'].get('noise_sigma', config['agent']['epsilon_initial'])  # OU noise scale on actions in [-1, 1]
         
         action_noise = OrnsteinUhlenbeckActionNoise(
             mean=np.zeros(n_actions),
@@ -221,16 +237,16 @@ def main():
         
         # Configure DDPG hyperparameters from config
         learning_rate = config['agent']['learning_rate']
-        buffer_size = config['agent']['buffer_size']
-        batch_size = config['agent']['batch_size']
+        buffer_size = args.buffer_size or config['agent']['buffer_size']
+        batch_size = args.batch_size or config['agent']['batch_size']
         tau = config['agent']['tau']
         gamma = config['agent']['gamma']
         
         # Policy network architecture
         policy_kwargs = {
             "net_arch": {
-                "pi": config['qnetwork']['actor_hidden_layers'], 
-                "qf": config['qnetwork']['critic_hidden_layers']
+                "pi": [int(x) for x in args.net.split(',')] if args.net else config['qnetwork']['actor_hidden_layers'],
+                "qf": [int(x) for x in args.net.split(',')] if args.net else config['qnetwork']['critic_hidden_layers']
             }
         }
         
@@ -245,6 +261,7 @@ def main():
             tau=tau,
             gamma=gamma,
             seed = random_seed,
+            gradient_steps=args.utd * max(args.n_envs, 1),  # --utd gradient steps per collected transition
             policy_kwargs=policy_kwargs,
             verbose=1,
             tensorboard_log=log_dir
@@ -252,8 +269,8 @@ def main():
         
         # Set up callbacks
         checkpoint_callback = CheckpointCallback(
-            save_freq=max(max_episode_steps // 10, 1),  # Save every 1/10 of max timesteps
-            save_path=os.path.join(log_dir, "checkpoints"),
+            save_freq=max(100000 // max(args.n_envs, 1), 1),  # every ~100k env steps = checkpoint-eval spacing (vec-env calls)
+            save_path=checkpoint_dir(log_dir),   # on /scratch (vec_env_utils)
             name_prefix="ddpg_auv_model"
         )
         
@@ -282,7 +299,7 @@ def main():
         try:
             model.learn(
                 total_timesteps=total_timesteps,
-                callback=[checkpoint_callback, plot_callback],
+                callback=[TrackingLogger(), checkpoint_callback, plot_callback],
                 log_interval=10
             )
             
@@ -345,3 +362,10 @@ def main():
 
 if __name__ == "__main__":
     main()
+    # ROS spin threads inside the SubprocVecEnv workers keep the interpreter alive after training,
+    # so stop the workers explicitly and exit (otherwise a batch job holds its node until the time limit).
+    import multiprocessing, sys
+    sys.stdout.flush()
+    for p in multiprocessing.active_children():
+        p.terminate()
+    os._exit(0)

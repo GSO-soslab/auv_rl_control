@@ -5,8 +5,10 @@ max_servo_angle_rad: 0.785
 qnetwork:
   # actor_hidden_layers: [256,256 ,256] 
   # critic_hidden_layers: [256, 256, 256] 
-  actor_hidden_layers: [32, 300 ,500, 200 ,16] 
-  critic_hidden_layers: [32, 300 ,500, 200, 16] 
+  # actor_hidden_layers: [32, 300 ,500, 200 ,16] 
+  # critic_hidden_layers: [32, 300 ,500, 200, 16] 
+  actor_hidden_layers: [256, 256]
+  critic_hidden_layers: [256, 256]
   use_batch_norm: true
 
 agent:
@@ -19,6 +21,7 @@ agent:
   dbd_decrease_factor: 0.0005   # phi: how much to decrease learning rate
   dbd_momentum: 0.0005          # alpha: momentum factor
   tau: 0.001           # Soft update factor for target network
+  noise_sigma: 0.2      # OU exploration noise (was epsilon_initial 0.01 = almost none)
   epsilon_initial: 0.01  # Initial exploration rate for epsilon-greedy policy
   epsilon_decay: 0.991   # Rate at which epsilon decays per episode
   epsilon_min: 0.001     # Minimum value for epsilon
@@ -81,4 +84,4 @@ plotting:
   plot_interval: 10
 
 others:
-  random_seed: 42      # General random seed for reproducibility
+  random_seed: null  # null = new random seed each run (printed at start); set a number to reproduce

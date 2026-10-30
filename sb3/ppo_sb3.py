@@ -23,6 +23,8 @@ import gym
 
 # Import custom environment
 from AUVEnv import AUVEnv
+from vec_env_utils import checkpoint_dir, make_env
+from tracking_logger import TrackingLogger
 
 class GradientMonitoringCallback(BaseCallback):
     """
@@ -313,6 +315,9 @@ def main():
     parser.add_argument('--model', type=str, default=None, help='Path to model file for testing OR initial model for transfer learning')
     parser.add_argument('--resume_from_checkpoint', type=str, default=None, help='Path to a .zip model file to resume training from')
     parser.add_argument('--timesteps', type=int, default=None, help='Total timesteps for training (overall target)')
+    parser.add_argument('--seed', type=int, default=None, help='Random seed (default: config others.random_seed; random if that is null)')
+    parser.add_argument('--n_envs', type=int, default=1, help='Parallel sims feeding one learner (each on its own ROS domain)')
+    parser.add_argument('--domain_base', type=int, default=None, help='ROS_DOMAIN_ID of sim 0 (default: $ROS_DOMAIN_ID)')
     parser.add_argument('--gradient_monitor_interval', type=int, default=100, help='Interval for gradient monitoring (default: 100)')
     args = parser.parse_args()
 
@@ -321,12 +326,15 @@ def main():
     config = load_config(config_path)
 
     # Set random seed
-    random_seed = config['others']['random_seed']
+    random_seed = args.seed if args.seed is not None else config['others'].get('random_seed')
+    if random_seed is None:
+        random_seed = int.from_bytes(os.urandom(4), 'little') % 100000
+    print(f"Random seed: {random_seed}")
     np.random.seed(random_seed)
     th.manual_seed(random_seed)
 
     # Create environment
-    env = AUVEnv()
+    env = make_env(args.n_envs if args.mode == 'train' else 1, args.domain_base)
 
     # Set up logging directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -334,7 +342,11 @@ def main():
         log_dir_base_name = os.path.splitext(os.path.basename(args.resume_from_checkpoint))[0]
         log_dir = os.path.join("logs", f"ppo_resumed_{log_dir_base_name}_{timestamp}")
     else:
-        log_dir = os.path.join("logs", f"ppo_{timestamp}")
+        run_tag = "".join(f"_{k.split('_', 1)[1].lower()}-{os.environ[k]}" for k in
+                          ("RACE2_VEHICLE", "RACE2_STAGE", "RACE2_SURGE_REWARD", "RACE2_ACTION", "RACE2_SERVOS", "RACE2_SERVO_LIMIT_DEG",
+                           "RACE2_PAPER_TERMS", "RACE2_DEPTH_INV", "RACE2_ATT_SP", "RACE2_K_SLEW", "RACE2_REF_ALL", "RACE2_ATT_REP", "RACE2_INTEGRAL", "RACE2_ROLL_MAX_DEG",
+                           "RACE2_PITCH_MAX_DEG", "RACE2_DEPTH_MAX") if k in os.environ) + f"_seed-{random_seed}"
+        log_dir = os.path.join("logs", f"ppo_{timestamp}{run_tag}")
     os.makedirs(log_dir, exist_ok=True)
     print(f"Logging to: {log_dir}")
 
@@ -342,6 +354,9 @@ def main():
         # Configure PPO hyperparameters from config
         learning_rate = config['agent']['learning_rate']
         n_steps = config['agent']['n_steps']
+        if args.n_envs > 1:  # keep the rollout size (n_steps * n_envs) of the single-env config
+            n_steps = max(64, n_steps // args.n_envs)
+            print(f"n_envs={args.n_envs}: n_steps per env -> {n_steps} (rollout {n_steps * args.n_envs})")
         batch_size = config['agent']['batch_size']
         n_epochs = config['agent']['n_epochs']
         gamma = config['agent']['gamma']
@@ -413,8 +428,8 @@ def main():
         # Set up callbacks
         max_episode_steps = config['training']['max_t']
         checkpoint_callback = CheckpointCallback(
-            save_freq=max(config['training']['save_freq_timesteps'], max_episode_steps),
-            save_path=os.path.join(log_dir, "checkpoints"),
+            save_freq=max(config['training']['save_freq_timesteps'] // max(args.n_envs, 1), 1),  # in vec-env calls
+            save_path=checkpoint_dir(log_dir),   # on /scratch (vec_env_utils)
             name_prefix="ppo_auv_model"
         )
 
@@ -445,7 +460,7 @@ def main():
             try:
                 model.learn(
                     total_timesteps=total_timesteps,
-                    callback=[checkpoint_callback, plot_callback, gradient_callback],
+                    callback=[TrackingLogger(), checkpoint_callback, plot_callback, gradient_callback],
                     log_interval=1,
                     reset_num_timesteps=False
                 )
@@ -540,4 +555,17 @@ def main():
         print(f"Average Length: {avg_length:.2f} steps")
 
 if __name__ == "__main__":
-    main()
+    import multiprocessing, sys, traceback
+    code = 0
+    try:
+        main()
+    except BaseException:   # e.g. a full disk on save (2026-10-30): exit now with the error, don't hang
+        traceback.print_exc()
+        code = 1
+    # ROS spin threads inside the SubprocVecEnv workers keep the interpreter alive after training (and after an
+    # exception), so stop the workers explicitly and exit (otherwise a batch job holds its node until the time limit).
+    sys.stdout.flush()
+    sys.stderr.flush()
+    for p in multiprocessing.active_children():
+        p.terminate()
+    os._exit(code)
